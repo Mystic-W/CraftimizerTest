@@ -45,6 +45,20 @@ public sealed unsafe class RecipeNote : Window, IDisposable
     private const string WindowNamePinned = "Craftimizer Crafting Log Helper###CraftimizerRecipeNote";
     private const string WindowNameFloating = $"{WindowNamePinned}Floating";
 
+    private IntPtr lastSeenRecipeEntryPtr = IntPtr.Zero;
+
+    private void RunPointerDiagnostics(IntPtr addressToTest)
+    {
+        if (addressToTest == IntPtr.Zero)
+        {
+            Service.PluginLog.Info("[Pointer Test] Address was IntPtr.Zero, skipping VirtualQuery");
+            return;
+        }
+
+        bool isValid = NativeMethods.IsMemoryValid(addressToTest);
+        Service.PluginLog.Info($"[Pointer Test] Checking address {addressToTest.ToString("X")}: IsValid = {isValid}");
+    }
+
     public enum CraftableStatus 
     {
         OK,
@@ -192,20 +206,13 @@ public sealed unsafe class RecipeNote : Window, IDisposable
         if (Service.ClientState.LocalPlayer == null)
             return false;
 
+        // Your original local functions to detect which addon is active. This logic is sound.
         bool ShouldUseRecipeNote()
         {
             var recipeNotePtr = Service.GameGui.GetAddonByName("RecipeNote");
-
-            if (recipeNotePtr.IsNull)
-                return false;
-
+            if (recipeNotePtr.IsNull) return false;
             Addon = (AtkUnitBase*)recipeNotePtr.Address;
-
-            // Check if RecipeNote addon is visible
-            if (Addon->WindowNode == null)
-                return false;
-
-            // Check if RecipeNote has a visible selected recipe and has returned a valid pointer 
+            if (Addon->WindowNode == null) return false;
             var recipeDisplayNode = Addon->GetNodeById(57);
             return recipeDisplayNode != null && recipeDisplayNode->IsVisible();
         }
@@ -213,45 +220,71 @@ public sealed unsafe class RecipeNote : Window, IDisposable
         bool ShouldUseWKSRecipeNote()
         {
             var wksNotePtr = Service.GameGui.GetAddonByName("WKSRecipeNotebook");
-            if (wksNotePtr.IsNull)
-                return false;
-
+            if (wksNotePtr.IsNull) return false;
             Addon = (AtkUnitBase*)wksNotePtr.Address;
-            if (Addon == null)
-                return false;
-
-            // Check if WKS addon is visible
-            if (Addon->WindowNode == null)
-                return false;
-
-            // Check if WKS has a visible selected recipe and has returned a valid pointer
+            if (Addon == null || Addon->WindowNode == null) return false;
             var wksRecipeDisplayNode = Addon->GetNodeById(13);
             return wksRecipeDisplayNode != null && wksRecipeDisplayNode->IsVisible();
         }
 
-        if (ShouldUseRecipeNote())
-            IsWKS = false;
-        else if (ShouldUseWKSRecipeNote())
-            IsWKS = true;
-        else
-            return false;
+        // Determine if any relevant addon is active.
+        bool isAddonVisible = ShouldUseRecipeNote() || ShouldUseWKSRecipeNote();
 
+        // --- THIS IS THE CORRECTED POINTER ACCESS LOGIC ---
+        IntPtr currentRecipeEntryPtr = IntPtr.Zero;
+        try
+        {
+            // Step 1: Check the instance
+            var instance = CSRecipeNote.Instance();
+            if (instance != null)
+            {
+                // Step 2: Check the RecipeList
+                var recipeList = instance->RecipeList;
+                if (recipeList != null)
+                {
+                    // Step 3: Only now is it safe to get the SelectedRecipe
+                    currentRecipeEntryPtr = (IntPtr)recipeList->SelectedRecipe;
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            Service.PluginLog.Error(e, "A deep exception occurred while trying to access CSRecipeNote. This is a failsafe.");
+            currentRecipeEntryPtr = IntPtr.Zero; // Ensure it's null on failure
+        }
+        // --- END OF CORRECTED LOGIC ---
+
+
+        // --- THE DIAGNOSTIC LOGIC ---
+        if (currentRecipeEntryPtr != this.lastSeenRecipeEntryPtr)
+        {
+            Service.PluginLog.Info($"[Pointer Watcher] State changed: {this.lastSeenRecipeEntryPtr.ToString("X")} -> {currentRecipeEntryPtr.ToString("X")}");
+
+            if (this.lastSeenRecipeEntryPtr != IntPtr.Zero)
+            {
+                Service.PluginLog.Debug("[Pointer Watcher] Checking final state of the previous pointer...");
+                RunPointerDiagnostics(this.lastSeenRecipeEntryPtr);
+            }
+
+            if (currentRecipeEntryPtr != IntPtr.Zero)
+            {
+                Service.PluginLog.Debug("[Pointer Watcher] Checking initial state of the new pointer...");
+                RunPointerDiagnostics(currentRecipeEntryPtr);
+            }
+
+            this.lastSeenRecipeEntryPtr = currentRecipeEntryPtr;
+        }
+
+        // If no addon is visible or no recipe is selected, we have nothing to do.
+        if (!isAddonVisible || currentRecipeEntryPtr == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        // --- YOUR ORIGINAL DATA GATHERING LOGIC ---
         StatsChanged = false;
         {
-            var instance = CSRecipeNote.Instance();
-
-            if (instance == null)
-                return false;
-
-            var list = instance->RecipeList;
-
-            if (list == null)
-                return false;
-
-            var recipeEntry = list->SelectedRecipe;
-            if (recipeEntry == null)
-                return false;
-
+            var recipeEntry = (CSRecipeNote.RecipeEntry*)currentRecipeEntryPtr;
             var recipeId = recipeEntry->RecipeId;
             if (recipeId != RecipeData?.RecipeId)
             {
@@ -263,13 +296,9 @@ public sealed unsafe class RecipeNote : Window, IDisposable
         Gearsets.GearsetItem[] gearItems;
         {
             var gearStats = Gearsets.CalculateGearsetCurrentStats();
-
             var container = InventoryManager.Instance()->GetInventoryContainer(InventoryType.EquippedItems);
-            if (container == null)
-                return false;
-
+            if (container == null) return false;
             gearItems = Gearsets.GetGearsetItems(container);
-
             var characterStats = Gearsets.CalculateCharacterStats(gearStats, gearItems, RecipeData.ClassJob.GetPlayerLevel(), RecipeData.ClassJob.CanPlayerUseManipulation());
             if (characterStats != CharacterStats)
             {
@@ -292,23 +321,16 @@ public sealed unsafe class RecipeNote : Window, IDisposable
 
         if ((StatsChanged || qualityChanged) && CraftStatus == CraftableStatus.OK)
         {
-            // Stats changed and we are still craftable, so we need to recalculate
             CalculateSavedMacro();
-
-            // If we want to suggest automatically, we should recalculate
             if (Service.Configuration.SuggestMacroAutomatically)
                 CalculateSuggestedMacro();
-            // Otherwise, we should cancel and clean out the task
             else
             {
                 SuggestedMacroTask?.Cancel();
                 SuggestedMacroTask = null;
             }
-            
-            // If we want to search automatically, we should recalculate
             if (Service.Configuration.ShowCommunityMacros && Service.Configuration.SearchCommunityMacroAutomatically)
                 CalculateCommunityMacro();
-            // Otherwise, we should cancel and clean out the task
             else
             {
                 CommunityMacroTask?.Cancel();
